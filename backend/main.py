@@ -1,13 +1,32 @@
-import json
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict
-from uuid import uuid4
-from pydantic import BaseModel 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+from typing import List, Optional
 
-from models import TaskItem, LocationUpdate, User, LoginRequest
+# Import everything from your clean models file
+from models import (
+    Base, UserDB, TaskDB, 
+    UserCreate, TaskCreate, TaskUpdate, 
+    LoginRequest, DeleteRequest, 
+    LocationUpdate, ItemSearch
+)
 from store_logic import find_nearby_deals
+
+# --- DATABASE SETUP ---
+# Render provides DATABASE_URL, otherwise use local SQLite file
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nextoyou.db")
+
+# Fix for Render's postgres:// vs sqlalchemy's postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Create Tables
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
@@ -19,130 +38,133 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- FILE BASED DATABASE ---
-USERS_FILE = "users_db.json"
-TASKS_FILE = "tasks_db.json"
-
-def load_data(filename, default):
-    if not os.path.exists(filename):
-        return default
-    with open(filename, 'r') as f:
-        return json.load(f)
-
-def save_data(filename, data):
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=4)
-
-# Load DBs on startup
-users_db = load_data(USERS_FILE, {}) 
-tasks_db = load_data(TASKS_FILE, []) 
-
-class ItemSearch(BaseModel):
-    latitude: float
-    longitude: float
-    item_name: str
-
-class DeleteRequest(BaseModel):
-    username: str
-    password: str
-
-class TaskUpdate(BaseModel):
-    title: Optional[str] = None
-    category: Optional[str] = None
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 @app.get("/")
 def read_root():
-    return {"status": "NextToYou Server is Online"}
+    return {"status": "NextToYou Server is Online (SQL Active)"}
 
 # --- AUTH ENDPOINTS ---
 @app.post("/register")
-def register(user: User):
-    if user.username in users_db:
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    existing_user = db.query(UserDB).filter(UserDB.username == user.username).first()
+    if existing_user:
         raise HTTPException(status_code=400, detail="User already exists")
     
-    users_db[user.username] = user.dict()
-    save_data(USERS_FILE, users_db)
+    new_user = UserDB(
+        username=user.username,
+        password=user.password,
+        active_start_hour=user.active_start_hour,
+        active_end_hour=user.active_end_hour,
+        notification_radius=user.notification_radius
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
     return {"message": "User registered", "user": user}
 
 @app.post("/login")
-def login(req: LoginRequest):
-    user = users_db.get(req.username)
-    if not user or user['password'] != req.password:
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.username == req.username).first()
+    if not user or user.password != req.password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    return {"message": "Login successful", "user": user}
+    
+    user_data = {
+        "username": user.username,
+        "active_start_hour": user.active_start_hour,
+        "active_end_hour": user.active_end_hour,
+        "notification_radius": user.notification_radius,
+        "password": user.password
+    }
+    return {"message": "Login successful", "user": user_data}
 
-# --- NEW: DELETE ACCOUNT ---
 @app.post("/delete-account")
-def delete_account(req: DeleteRequest):
-    if req.username not in users_db:
+def delete_account(req: DeleteRequest, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.username == req.username).first()
+    if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Check password for security
-    if users_db[req.username]["password"] != req.password:
+    if user.password != req.password:
         raise HTTPException(status_code=401, detail="Wrong password")
 
-    # 1. Delete the user
-    del users_db[req.username]
-    save_data(USERS_FILE, users_db)
-
-    # 2. Delete all their tasks
-    global tasks_db
-    tasks_db = [t for t in tasks_db if t.get('user_id') != req.username]
-    save_data(TASKS_FILE, tasks_db)
-
+    db.delete(user)
+    db.query(TaskDB).filter(TaskDB.user_id == req.username).delete()
+    db.commit()
     return {"message": "Account deleted"}
 
 # --- TASK ENDPOINTS ---
 @app.get("/tasks/{user_id}")
-def get_tasks(user_id: str):
-    return [t for t in tasks_db if t.get('user_id') == user_id]
+def get_tasks(user_id: str, db: Session = Depends(get_db)):
+    tasks = db.query(TaskDB).filter(TaskDB.user_id == user_id).all()
+    return [{"id": str(t.id), "title": t.title, "category": t.category, "is_completed": t.is_completed} for t in tasks]
 
 @app.post("/tasks")
-def create_task(task: TaskItem):
-    task.id = str(uuid4())
-    tasks_db.append(task.dict())
-    save_data(TASKS_FILE, tasks_db)
-    return task
-# ... (inside backend/main.py)
+def create_task(task: TaskCreate, db: Session = Depends(get_db)):
+    new_task = TaskDB(
+        title=task.title,
+        category=task.category,
+        is_completed=task.is_completed,
+        user_id=task.user_id
+    )
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
+    return {"id": str(new_task.id), "title": new_task.title, "category": new_task.category}
 
 @app.put("/tasks/{task_id}")
-def update_task(task_id: str, update: TaskUpdate):
-    global tasks_db
-    for task in tasks_db:
-        if task['id'] == task_id:
-            if update.title:
-                task['title'] = update.title
-            if update.category:
-                task['category'] = update.category
-            save_data(TASKS_FILE, tasks_db)
-            return task
-    raise HTTPException(status_code=404, detail="Task not found")
+def update_task(task_id: str, update: TaskUpdate, db: Session = Depends(get_db)):
+    try:
+        t_id = int(task_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Task ID")
+
+    task = db.query(TaskDB).filter(TaskDB.id == t_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if update.title:
+        task.title = update.title
+    if update.category:
+        task.category = update.category
+        
+    db.commit()
+    db.refresh(task)
+    return {"id": str(task.id), "title": task.title, "category": task.category}
 
 @app.delete("/tasks/{task_id}")
-def delete_task(task_id: str):
-    global tasks_db
-    tasks_db = [t for t in tasks_db if t['id'] != task_id]
-    save_data(TASKS_FILE, tasks_db)
+def delete_task(task_id: str, db: Session = Depends(get_db)):
+    try:
+        t_id = int(task_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Task ID")
+        
+    task = db.query(TaskDB).filter(TaskDB.id == t_id).first()
+    if task:
+        db.delete(task)
+        db.commit()
     return {"status": "deleted"}
 
-# --- PROXIMITY (Small Radius - For Push Notifications) ---
+# --- PROXIMITY ---
 @app.post("/check-proximity")
-def check_proximity(loc: LocationUpdate):
-    user = users_db.get(loc.user_id)
-    # Use User's preferred radius (usually small, e.g., 50m)
-    radius = user['notification_radius'] if user else 50
+def check_proximity(loc: LocationUpdate, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.username == loc.user_id).first()
+    radius = user.notification_radius if user else 50
 
-    user_tasks = [t['title'] for t in tasks_db if t.get('user_id') == loc.user_id and not t['is_completed']]
+    tasks = db.query(TaskDB).filter(TaskDB.user_id == loc.user_id, TaskDB.is_completed == False).all()
+    user_task_titles = [t.title for t in tasks]
     
-    if not user_tasks:
+    if not user_task_titles:
         return {"message": "No active tasks."}
 
-    deals = find_nearby_deals(loc.latitude, loc.longitude, user_tasks, radius=radius)
+    deals = find_nearby_deals(loc.latitude, loc.longitude, user_task_titles, radius=radius)
     return {"nearby": deals}
 
-# --- MAP SEARCH (Huge Radius - For Planning) ---
 @app.post("/search-item")
 def search_item(search: ItemSearch):
-    # SEARCH RADIUS: 20,000 meters (20km) so you see EVERYTHING in the city
     deals = find_nearby_deals(search.latitude, search.longitude, [search.item_name], radius=20000)
     return {"results": deals}
