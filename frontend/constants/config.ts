@@ -7,7 +7,7 @@ import { Platform } from 'react-native';
 // switch between for local aand onrender server
 const LIVE_SERVER_URL = 'https://nexttoyou2.onrender.com'; //192.168.68.100
 
-const LOCAL_SERVER_URL = 'http://localhost:8000';
+const LOCAL_SERVER_URL = 'http://localhost:8081';
 
 // Logic to pick the right server automatically
 const getBaseUrl = () => {
